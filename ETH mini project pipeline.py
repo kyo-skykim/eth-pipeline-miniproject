@@ -1,21 +1,31 @@
 # Databricks notebook source
-# DBTITLE 1,impoet function , add Error Handling (try-except) Around the API Call
+# DBTITLE 1,Config — change these without touching pipeline logic
+# ============================================================
+# CONFIG BLOCK — single source of truth for the whole pipeline
+# ============================================================
+COIN_ID     = "ethereum"
+VS_CURRENCY = "usd"
+DAYS_BACK   = 30
+INTERVAL    = "daily"
+VIEW_NAME   = "eth_daily"
+API_TIMEOUT = 10  # seconds
+
+# Build URL/params from config — no hardcoded strings in logic
+BASE_URL = f"https://api.coingecko.com/api/v3/coins/{COIN_ID}/market_chart"
+PARAMS   = {"vs_currency": VS_CURRENCY, "days": DAYS_BACK, "interval": INTERVAL}
+
+# COMMAND ----------
+
+# DBTITLE 1,Import + Error Handling (try-except) Around the API Call
 import requests
-import pandas as pd
-import sqlite3
 import logging
-from datetime import datetime
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- IMPROVED: Wrap API call in try-except ---
-URL = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart"
-PARAMS = {"vs_currency": "usd", "days": 30, "interval": "daily"}
-
 try:
-    response = requests.get(URL, params=PARAMS, timeout=10)  # timeout prevents hanging forever
+    response = requests.get(BASE_URL, params=PARAMS, timeout=API_TIMEOUT)  # timeout prevents hanging forever
     response.raise_for_status()  # raises an error for 4xx/5xx HTTP codes
     data = response.json()
     logger.info("API call successful. Records received.")
@@ -38,9 +48,16 @@ except requests.exceptions.RequestException as e:
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, LongType, DoubleType
 
-# Build rows directly from the raw API response
-prices  = data['prices']   # [[timestamp, price], ...]
-volumes = data['total_volumes']  # [[timestamp, volume], ...]
+# Pull the raw arrays from the API response
+prices  = data['prices']          # [[timestamp, price], ...]
+volumes = data['total_volumes']   # [[timestamp, volume], ...]
+
+# Sanity check: zip() silently truncates to the shorter list, so verify alignment
+if len(prices) != len(volumes):
+    logger.warning(
+        f"prices ({len(prices)}) and volumes ({len(volumes)}) have different lengths; "
+        f"rows will be truncated to {min(len(prices), len(volumes))}."
+    )
 
 # Zip into a list of tuples: (timestamp, price, volume)
 rows = [
@@ -67,30 +84,8 @@ df_clean = df_spark.withColumn(
     F.round("volume", 2).alias("volume")
 )
 
-df_clean.createOrReplaceTempView("eth_daily")
-logger.info(f"Temp view created. Row count: {df_clean.count()}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Separate Config from Logic (Use Constants / A Config Block)
-# ============================================================
-# CONFIG BLOCK — change these without touching pipeline logic
-# ============================================================
-COIN_ID        = "ethereum"
-VS_CURRENCY    = "usd"
-DAYS_BACK      = 30
-INTERVAL       = "daily"
-DB_PATH        = "crypto_data.db"
-TABLE_NAME     = "eth_daily"
-VIEW_NAME      = "eth_daily"
-API_TIMEOUT    = 10  # seconds
-
-# Date format for display: วัน/เดือน/ปี
-DATE_FORMAT    = "dd/MM/yyyy"
-
-# Build URL from config — no hardcoded strings in logic
-BASE_URL = f"https://api.coingecko.com/api/v3/coins/{COIN_ID}/market_chart"
-PARAMS   = {"vs_currency": VS_CURRENCY, "days": DAYS_BACK, "interval": INTERVAL}
+df_clean.createOrReplaceTempView(VIEW_NAME)
+logger.info(f"Temp view '{VIEW_NAME}' created. Row count: {df_clean.count()}")
 
 # COMMAND ----------
 
@@ -99,69 +94,54 @@ display(df_clean)
 
 # COMMAND ----------
 
-# DBTITLE 1,Daily % Return + Cumulative Return
+# DBTITLE 1,Shared returns view — single source of truth for daily return
 # MAGIC %sql
-# MAGIC     
-# MAGIC -- COMMAND ----------
-# MAGIC -- DBTITLE 1, Q1: Daily Return & Cumulative Performance
-# MAGIC
-# MAGIC WITH daily_returns AS (
-# MAGIC     SELECT
-# MAGIC         date,
-# MAGIC         price,
-# MAGIC         LAG(price) OVER (ORDER BY date)     AS prev_price,
-# MAGIC
-# MAGIC         ROUND(
-# MAGIC             (price - LAG(price) OVER (ORDER BY date))
-# MAGIC             / LAG(price) OVER (ORDER BY date) * 100
-# MAGIC         , 2)                                AS daily_return_pct
-# MAGIC
-# MAGIC     FROM eth_daily
-# MAGIC )
-# MAGIC
+# MAGIC -- Daily return is needed by every analysis below. Compute it ONCE here
+# MAGIC -- instead of repeating the LAG() expression in each query.
+# MAGIC CREATE OR REPLACE TEMP VIEW eth_returns AS
 # MAGIC SELECT
 # MAGIC     date,
-# MAGIC     ROUND(price, 2)         AS close_price,
-# MAGIC     ROUND(prev_price, 2)    AS prev_close,
-# MAGIC     daily_return_pct,
+# MAGIC     price,
+# MAGIC     LAG(price) OVER (ORDER BY date) AS prev_price,
+# MAGIC     ROUND(
+# MAGIC         (price - LAG(price) OVER (ORDER BY date))
+# MAGIC         / LAG(price) OVER (ORDER BY date) * 100
+# MAGIC     , 4) AS daily_return_pct
+# MAGIC FROM eth_daily;
+
+# COMMAND ----------
+
+# DBTITLE 1,Q1: Daily Return & Cumulative Performance
+# MAGIC %sql
+# MAGIC SELECT
+# MAGIC     date,
+# MAGIC     ROUND(price, 2)                 AS close_price,
+# MAGIC     ROUND(prev_price, 2)            AS prev_close,
+# MAGIC     ROUND(daily_return_pct, 2)      AS daily_return_pct,
 # MAGIC
 # MAGIC     -- Cumulative return anchored to Day 1
 # MAGIC     ROUND(
 # MAGIC         (price - FIRST_VALUE(price) OVER (ORDER BY date))
 # MAGIC         / FIRST_VALUE(price) OVER (ORDER BY date) * 100
-# MAGIC     , 2)                    AS cumulative_return_pct,
+# MAGIC     , 2)                            AS cumulative_return_pct,
 # MAGIC
 # MAGIC     CASE
-# MAGIC         WHEN daily_return_pct >  3  THEN 'Strong Up'
-# MAGIC         WHEN daily_return_pct >  0  THEN 'Up'
-# MAGIC         WHEN daily_return_pct =  0  THEN 'Flat'
-# MAGIC         WHEN daily_return_pct > -3  THEN 'Down'
-# MAGIC         ELSE                             'Strong Down'
-# MAGIC     END                     AS day_sentiment
+# MAGIC         WHEN daily_return_pct IS NULL THEN 'N/A (first day)'
+# MAGIC         WHEN daily_return_pct >  3    THEN 'Strong Up'
+# MAGIC         WHEN daily_return_pct >  0    THEN 'Up'
+# MAGIC         WHEN daily_return_pct =  0    THEN 'Flat'
+# MAGIC         WHEN daily_return_pct > -3    THEN 'Down'
+# MAGIC         ELSE                               'Strong Down'
+# MAGIC     END                             AS day_sentiment
 # MAGIC
-# MAGIC FROM daily_returns
+# MAGIC FROM eth_returns
 # MAGIC ORDER BY date DESC;
 
 # COMMAND ----------
 
-# DBTITLE 1,Rolling 7-Day Volatility
+# DBTITLE 1,Q2: Rolling 7-Day Volatility & Risk Trend
 # MAGIC %sql
-# MAGIC     
-# MAGIC -- COMMAND ----------
-# MAGIC -- DBTITLE 1, Q2: Rolling Volatility & Risk Trend
-# MAGIC
-# MAGIC WITH returns AS (
-# MAGIC     SELECT
-# MAGIC         date,
-# MAGIC         price,
-# MAGIC         ROUND(
-# MAGIC             (price - LAG(price) OVER (ORDER BY date))
-# MAGIC             / LAG(price) OVER (ORDER BY date) * 100
-# MAGIC         , 4)    AS daily_return_pct
-# MAGIC     FROM eth_daily
-# MAGIC ),
-# MAGIC
-# MAGIC volatility AS (
+# MAGIC WITH volatility AS (
 # MAGIC     SELECT
 # MAGIC         date,
 # MAGIC         price,
@@ -183,7 +163,7 @@ display(df_clean)
 # MAGIC             )
 # MAGIC         , 4)    AS volatility_prev_7d
 # MAGIC
-# MAGIC     FROM returns
+# MAGIC     FROM eth_returns
 # MAGIC )
 # MAGIC
 # MAGIC SELECT
@@ -195,9 +175,10 @@ display(df_clean)
 # MAGIC
 # MAGIC     -- Is the market getting riskier or calmer?
 # MAGIC     CASE
-# MAGIC         WHEN volatility_7d > volatility_prev_7d THEN 'Rising Risk'
-# MAGIC         WHEN volatility_7d < volatility_prev_7d THEN 'Falling Risk'
-# MAGIC         ELSE                                         'Stable'
+# MAGIC         WHEN volatility_prev_7d IS NULL          THEN 'Insufficient History'
+# MAGIC         WHEN volatility_7d > volatility_prev_7d  THEN 'Rising Risk'
+# MAGIC         WHEN volatility_7d < volatility_prev_7d  THEN 'Falling Risk'
+# MAGIC         ELSE                                          'Stable'
 # MAGIC     END                     AS risk_trend,
 # MAGIC
 # MAGIC     -- Where does today's volatility rank in the full 30-day window?
@@ -211,20 +192,13 @@ display(df_clean)
 
 # COMMAND ----------
 
-# DBTITLE 1,Anomaly Detection via Z-Score
+# DBTITLE 1,Q3: Anomaly Detection (Z-Score Method)
 # MAGIC %sql
-# MAGIC     
-# MAGIC -- COMMAND ----------
-# MAGIC -- DBTITLE 1, Q3: Anomaly Detection (Z-Score Method)
-# MAGIC
 # MAGIC WITH stats AS (
 # MAGIC     SELECT
 # MAGIC         date,
 # MAGIC         price,
-# MAGIC         ROUND(
-# MAGIC             (price - LAG(price) OVER (ORDER BY date))
-# MAGIC             / LAG(price) OVER (ORDER BY date) * 100
-# MAGIC         , 4)    AS daily_return_pct,
+# MAGIC         daily_return_pct,
 # MAGIC
 # MAGIC         -- 30-day rolling benchmark
 # MAGIC         AVG(price) OVER (
@@ -237,7 +211,7 @@ display(df_clean)
 # MAGIC             ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
 # MAGIC         )       AS rolling_std_30d
 # MAGIC
-# MAGIC     FROM eth_daily
+# MAGIC     FROM eth_returns
 # MAGIC ),
 # MAGIC
 # MAGIC zscore_calc AS (
